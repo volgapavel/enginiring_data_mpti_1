@@ -4,6 +4,7 @@ import logging
 import aiohttp
 import time
 import jwt
+import csv
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv, set_key
 from telegram import Update
@@ -24,6 +25,8 @@ try:
     TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
     YANDEX_FOLDER_ID = os.getenv('YANDEX_FOLDER_ID')
     AUTHORIZED_KEY_FILE = os.getenv('AUTHORIZED_KEY_FILE')
+    IAM_TOKEN = os.getenv('IAM_TOKEN')
+    IAM_TOKEN_EXPIRES = os.getenv('IAM_TOKEN_EXPIRES')
     
     # Чтение ключа из файла
     with open(AUTHORIZED_KEY_FILE, 'r') as f:
@@ -42,7 +45,41 @@ IAM_TOKEN_URL = "https://iam.api.cloud.yandex.net/iam/v1/tokens"
 # URL для API YandexGPT
 YANDEXGPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
 
-def save_token_to_env(token: str):
+# Путь к файлу с логами
+LOGS_FILE = 'bot_logs.csv'
+
+def is_token_expired() -> bool:
+    """Проверка срока действия токена"""
+    if not IAM_TOKEN or not IAM_TOKEN_EXPIRES:
+        return True
+    
+    try:
+        expires_at = datetime.fromisoformat(IAM_TOKEN_EXPIRES.replace('Z', '+00:00'))
+        # Обновляем токен за 5 минут до истечения срока
+        return datetime.now(timezone.utc) >= (expires_at - timedelta(minutes=5))
+    except Exception as e:
+        logger.error(f"Ошибка при проверке срока действия токена: {str(e)}")
+        return True
+
+def init_logs_file():
+    """Инициализация файла с логами"""
+    if not os.path.exists(LOGS_FILE):
+        with open(LOGS_FILE, 'w', newline='', encoding='utf-8') as file:
+            writer = csv.writer(file)
+            writer.writerow(['user_id', 'timestamp', 'action'])
+
+def log_user_action(user_id: int, action: str):
+    """Логирование действия пользователя"""
+    try:
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        with open(LOGS_FILE, 'a', newline='', encoding='utf-8') as file:
+            writer = csv.writer(file)
+            writer.writerow([user_id, timestamp, action])
+        logger.info(f"Действие пользователя {user_id} записано в лог: {action}")
+    except Exception as e:
+        logger.error(f"Ошибка при записи в лог: {str(e)}")
+
+def save_token_to_env(token: str, expires_at: str):
     """Сохранение токена в .env файл"""
     try:
         env_file_path = '.env'
@@ -52,16 +89,22 @@ def save_token_to_env(token: str):
                 lines = file.readlines()
         
         token_found = False
+        expires_found = False
         new_lines = []
         for line in lines:
             if line.strip().startswith("IAM_TOKEN="):
                 new_lines.append(f"IAM_TOKEN={token}\n")
                 token_found = True
+            elif line.strip().startswith("IAM_TOKEN_EXPIRES="):
+                new_lines.append(f"IAM_TOKEN_EXPIRES={expires_at}\n")
+                expires_found = True
             else:
                 new_lines.append(line)
         
         if not token_found:
             new_lines.append(f"IAM_TOKEN={token}\n")
+        if not expires_found:
+            new_lines.append(f"IAM_TOKEN_EXPIRES={expires_at}\n")
         
         with open(env_file_path, 'w') as file:
             file.writelines(new_lines)
@@ -97,6 +140,11 @@ def create_jwt_token():
 async def get_iam_token():
     """Получение IAM токена для авторизации"""
     try:
+        # Проверяем, не истек ли текущий токен
+        if not is_token_expired():
+            logger.info("Используем существующий IAM токен")
+            return IAM_TOKEN
+            
         # Подготовка данных для запроса
         data = {
             "jwt": create_jwt_token()
@@ -108,9 +156,10 @@ async def get_iam_token():
                 response.raise_for_status()
                 result = await response.json()
                 iam_token = result["iamToken"]
+                expires_at = result["expiresAt"]
                 
                 # Сохраняем токен в .env
-                save_token_to_env(iam_token)
+                save_token_to_env(iam_token, expires_at)
                 
                 logger.info("IAM токен успешно получен")
                 return iam_token
@@ -159,6 +208,8 @@ async def get_yandexgpt_response(prompt: str) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
+    user_id = update.effective_user.id
+    log_user_action(user_id, "start_command")
     await update.message.reply_text(
         "Привет! Я бот, использующий YandexGPT. "
         "Просто напиши мне сообщение, и я постараюсь на него ответить."
@@ -167,18 +218,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик текстовых сообщений"""
     try:
-        # Получение текста сообщения
+        user_id = update.effective_user.id
         user_message = update.message.text
-        logger.info(f"Получено сообщение от пользователя: {user_message}")
+        log_user_action(user_id, f"user_question: {user_message[:50]}...")  # Логируем первые 50 символов вопроса
         
-        # Получение ответа от YandexGPT
         response = await get_yandexgpt_response(user_message)
-        
-        # Отправка ответа пользователю
         await update.message.reply_text(response)
-        logger.info("Ответ успешно отправлен пользователю")
+        log_user_action(user_id, "bot_response_sent")
     except Exception as e:
         logger.error(f"Ошибка при обработке сообщения: {str(e)}")
+        log_user_action(user_id, f"error: {str(e)}")
         await update.message.reply_text(
             "Извините, произошла ошибка при обработке вашего запроса. "
             "Пожалуйста, попробуйте позже."
@@ -187,6 +236,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     """Основная функция"""
     try:
+        # Инициализация файла с логами
+        init_logs_file()
+        
         # Создание приложения
         application = Application.builder().token(TELEGRAM_TOKEN).build()
         
